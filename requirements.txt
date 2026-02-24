@@ -1,0 +1,9 @@
+yfinance>=0.2.50
+pandas>=2.1
+numpy>=1.26
+statsmodels>=0.14
+scipy>=1.11
+plotly>=5.18
+streamlit>=1.30
+openpyxl>=3.1
+click>=8.1

@@ -1,0 +1,23 @@
+{
+  "name": "US Large-Cap Tech",
+  "description": "Example basket of large-cap US technology companies",
+  "primary_ticker": "AAPL",
+  "basket_tickers": ["MSFT", "GOOGL", "META", "AMZN", "NVDA"],
+  "market_proxy": "SPY",
+  "date_range": {
+    "start": "2018-01-01",
+    "end": "2024-12-31"
+  },
+  "frequency": "ME",
+  "byod_path": null,
+  "fcf_use_ev": true,
+  "rolling_window": 36,
+  "winsor": {
+    "enabled": false,
+    "method": "percentile",
+    "p_low": 0.025,
+    "p_high": 0.025,
+    "n_std": 2.5,
+    "apply_to": ["fwd_cagr_3y", "ey", "ebitda_yld", "sales_yld", "fcf_yld"]
+  }
+}
