@@ -625,8 +625,13 @@ def main() -> None:
         st.header("Date & Frequency")
         start_date = st.date_input("Start date", value=pd.Timestamp("2021-01-01"))
         end_date   = st.date_input("End date",   value=pd.Timestamp.today().normalize())
-        freq_label = st.selectbox("Frequency", ["Monthly", "Quarterly"])
-        freq = "ME" if freq_label == "Monthly" else "QE"
+        freq_label = st.selectbox("Frequency", ["Monthly", "Quarterly", "Daily"])
+        freq = {"Monthly": "ME", "Quarterly": "QE", "Daily": "B"}[freq_label]
+        if freq_label == "Daily":
+            st.caption(
+                "Daily loads more data points. Fundamental metrics step at quarterly "
+                "intervals between earnings updates."
+            )
 
         st.divider()
         st.header("BYOD Data")
