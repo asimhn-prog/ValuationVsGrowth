@@ -27,6 +27,7 @@ from data_sources.byod import load_byod, validate_byod, REQUIRED_COLS as BYOD_RE
 from transforms.compute_ev import ensure_ev
 from transforms.compute_forward_metrics import (
     ALL_METRICS,
+    MULTIPLE_LABELS,
     YIELD_METRIC_LABELS,
     compute_valuation_yields,
 )
@@ -466,6 +467,121 @@ def premium_timeseries_plot(
     return fig
 
 
+def basket_gap_timeseries(
+    basket_panel: pd.DataFrame,
+    preds_df: pd.DataFrame,
+    cross_sec_df: pd.DataFrame,
+    metric: str,
+    primary: str,
+) -> go.Figure:
+    """
+    Time-series of the gap (actual multiple − predicted multiple) for every
+    basket ticker, plus the primary security.
+
+    For each date the cross-sectional coefficients are applied to every basket
+    ticker to get its 'fair' multiple; the gap is actual − fair.
+
+    • Shaded band = 25th–75th percentile across basket tickers each month.
+    • Green line   = basket mean gap.
+    • Blue line    = primary security gap.
+    • Dashed zero  = fairly-valued level.
+    """
+    fig = go.Figure()
+    x_col = "fwd_cagr_3y"
+    mult_label = MULTIPLE_LABELS.get(metric, metric)
+
+    # ── Basket gaps ────────────────────────────────────────────────────────────
+    if cross_sec_df is not None and not cross_sec_df.empty:
+        cs = cross_sec_df.set_index("date")[["c", "m"]]
+
+        work = basket_panel[["date", "ticker", metric, x_col]].copy()
+        work = work.join(cs, on="date")          # adds c and m per date
+        work["fair_yield"] = work["c"] + work["m"] * work[x_col]
+
+        # Keep only rows where both actual and fair yields are positive
+        valid = (
+            work[metric].notna() & (work[metric] > 0) &
+            work["fair_yield"].notna() & (work["fair_yield"] > 0) &
+            work[x_col].notna()
+        )
+        work = work[valid].copy()
+        work["gap"] = 1.0 / work[metric] - 1.0 / work["fair_yield"]
+
+        agg = (
+            work.groupby("date")["gap"]
+            .agg(
+                mean="mean",
+                p25=lambda s: s.quantile(0.25),
+                p75=lambda s: s.quantile(0.75),
+            )
+            .reset_index()
+        )
+
+        if not agg.empty:
+            # Shaded IQR band
+            fig.add_trace(go.Scatter(
+                x=pd.concat([agg["date"], agg["date"].iloc[::-1]]),
+                y=pd.concat([agg["p75"], agg["p25"].iloc[::-1]]),
+                fill="toself",
+                fillcolor="rgba(22, 163, 74, 0.12)",
+                line=dict(color="rgba(22, 163, 74, 0)"),
+                name="Basket IQR (25th–75th %ile)",
+                hoverinfo="skip",
+            ))
+            # Mean basket gap
+            fig.add_trace(go.Scatter(
+                x=agg["date"],
+                y=agg["mean"].round(2),
+                mode="lines",
+                name="Basket mean gap",
+                line=dict(color=_COLORS["basket"], width=2),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Basket mean gap: %{y:.1f}x<extra></extra>",
+            ))
+
+    # ── Primary security gap ───────────────────────────────────────────────────
+    if (
+        preds_df is not None
+        and "actual_multiple" in preds_df.columns
+        and "predicted_multiple" in preds_df.columns
+    ):
+        prim = preds_df.dropna(subset=["actual_multiple", "predicted_multiple"]).copy()
+        prim["gap"] = prim["actual_multiple"] - prim["predicted_multiple"]
+        if not prim.empty:
+            fig.add_trace(go.Scatter(
+                x=prim["date"],
+                y=prim["gap"].round(2),
+                mode="lines",
+                name=f"{primary}",
+                line=dict(color=_COLORS["security"], width=2.5),
+                hovertemplate=(
+                    f"Date: %{{x|%Y-%m-%d}}<br>"
+                    f"{primary} gap: %{{y:.1f}}x<extra></extra>"
+                ),
+            ))
+
+    # Zero reference
+    fig.add_hline(y=0, line=dict(color="#6b7280", dash="dash", width=1))
+
+    fig.update_layout(
+        title=dict(
+            text=f"Multiple Gap: Actual vs Predicted {mult_label}",
+            font=dict(size=15),
+        ),
+        xaxis=dict(title="Date", gridcolor="#e5e7eb"),
+        yaxis=dict(
+            title=f"Actual − Predicted {mult_label} (turns)",
+            gridcolor="#e5e7eb",
+            zeroline=False,
+        ),
+        legend=dict(orientation="h", y=-0.2),
+        hovermode="x unified",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=460,
+    )
+    return fig
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main app
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +916,23 @@ def main() -> None:
                 _c[4].metric("Z-score",         f"{cur.get('premium_zscore',np.nan):+.2f}"    if pd.notna(cur.get("premium_zscore")) else "–")
         else:
             st.info("No regression predictions available for this metric.")
+
+        st.divider()
+        st.subheader(f"Basket — Average Multiple Gap | {YIELD_METRIC_LABELS.get(metric, metric)}")
+        fig_gap = basket_gap_timeseries(
+            basket_panel=basket_panel,
+            preds_df=preds_df,
+            cross_sec_df=cross_sec_df if cross_sec_df is not None and not cross_sec_df.empty else pd.DataFrame(),
+            metric=metric,
+            primary=primary,
+        )
+        st.plotly_chart(fig_gap, use_container_width=True)
+        st.caption(
+            "Gap = actual multiple − predicted multiple from the cross-sectional regression.  "
+            "Positive = trading at a **premium** to fair value; "
+            "negative = **discount**.  "
+            "Shaded band shows 25th–75th percentile range across basket tickers."
+        )
 
     with tab3:
         st.subheader("Regression Summary (all metrics)")
