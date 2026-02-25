@@ -117,6 +117,11 @@ def load_byod(path: Union[str, Path]) -> pd.DataFrame:
 
     # ── Type coercion ────────────────────────────────────────────────────────
     df["date"]   = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    # Normalise dates: strip timezone (Bloomberg exports UTC) and time component
+    # so they align with the TZ-naive, date-only yfinance price index.
+    if df["date"].dt.tz is not None:
+        df["date"] = df["date"].dt.tz_localize(None)
+    df["date"] = df["date"].dt.normalize()   # floor to midnight
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
 
     for col in _NUMERIC_COLS:
@@ -128,6 +133,20 @@ def load_byod(path: Union[str, Path]) -> pd.DataFrame:
     if bad_dates.any():
         logger.warning("Dropped %d rows with unparseable dates.", bad_dates.sum())
         df = df[~bad_dates]
+
+    # ── Early exit if key columns are all NaN (Bloomberg #N/A Connection) ────
+    # This happens when Bloomberg cannot reach the server during export.
+    # Rather than silently loading empty data that would classify all tickers
+    # as Tier 1 with NaN metrics, raise a clear error so the caller can
+    # fall back to Tier 3 (yfinance) and surface the problem to the user.
+    n_valid_rev = df["fwd_revenue_1y"].notna().sum() if "fwd_revenue_1y" in df.columns else 0
+    n_valid_px  = df["price"].notna().sum() if "price" in df.columns else 0
+    if n_valid_rev == 0 and n_valid_px == 0:
+        raise ValueError(
+            "BYOD file appears to be a failed Bloomberg export: "
+            "all 'fwd_revenue_1y' and 'price' values are #N/A or missing. "
+            "Please refresh your Bloomberg connection and re-export."
+        )
 
     # ── Derive optional columns if absent ────────────────────────────────────
     if "market_cap" not in df.columns:
@@ -227,5 +246,17 @@ def validate_byod(df: pd.DataFrame) -> list[str]:
                 f"{n_ext} rows have fwd_revenue_4y / fwd_revenue_1y outside [0.1, 10] "
                 f"– check units or outliers."
             )
+        # Flag implausible implied 3Y CAGR (>50% suggests unit mismatch)
+        valid_ratio = ratio[(ratio > 0) & ratio.notna()]
+        if not valid_ratio.empty:
+            implied_cagr_pct = (valid_ratio.median() ** (1.0 / 3) - 1) * 100
+            if implied_cagr_pct > 50:
+                warnings.append(
+                    f"Implied 3Y revenue CAGR = {implied_cagr_pct:.0f}% (median) — "
+                    f"this is unusually high and may indicate a unit mismatch.  "
+                    f"Ensure both fwd_revenue_1y and fwd_revenue_4y are "
+                    f"ANNUAL figures in the same currency/units "
+                    f"(Bloomberg: BEST_SALES for FY+1, BEST_SALES with period override +4Y for FY+4)."
+                )
 
     return warnings
