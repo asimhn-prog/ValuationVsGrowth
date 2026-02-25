@@ -116,7 +116,7 @@ def load_byod(path: Union[str, Path]) -> pd.DataFrame:
         )
 
     # ── Type coercion ────────────────────────────────────────────────────────
-    df["date"]   = pd.to_datetime(df["date"], errors="coerce")
+    df["date"]   = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
 
     for col in _NUMERIC_COLS:
