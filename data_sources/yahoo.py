@@ -186,27 +186,67 @@ def fetch_trailing_fundamentals(
         logger.warning("No trailing fundamentals for %s", ticker)
         return pd.DataFrame()
 
-    # ── Extend ttm_revenue backward with annual data ──────────────────────────
-    # yfinance quarterly statements only cover ~5 recent quarters, giving only
-    # ~13 months of TTM history — not enough for a 36-month trailing CAGR.
-    # Annual income statements (5 fiscal years) let us extend the series back.
-    if "ttm_revenue" in rows:
-        try:
-            ann_inc = t.income_stmt
-            if ann_inc is not None and not ann_inc.empty:
-                ann_row = _first_row(ann_inc, ["Total Revenue"])
+    # ── Extend all series backward with annual data ───────────────────────────
+    # yfinance quarterly statements only cover ~5 recent quarters.  Annual
+    # statements (5 fiscal years) are used to fill earlier dates so that a
+    # 3-year trailing CAGR and EV-based metrics are available for the full
+    # requested date range.
+    def _extend_backward(rows_dict: dict, col: str, ann_series: pd.Series) -> None:
+        """Prepend annual data points that pre-date the existing quarterly data."""
+        ann_data = ann_series.sort_index().dropna()
+        ann_data.index = pd.to_datetime(ann_data.index)
+        existing = rows_dict.get(col, pd.Series(dtype=float))
+        existing_valid = existing.dropna()
+        cutoff = existing_valid.index.min() if not existing_valid.empty else pd.Timestamp.max
+        ann_early = ann_data[ann_data.index < cutoff]
+        if ann_early.empty:
+            return
+        if col in rows_dict:
+            rows_dict[col] = pd.concat([ann_early, rows_dict[col]]).sort_index()
+        else:
+            rows_dict[col] = ann_early
+
+    # Annual income statement → extend TTM income items
+    try:
+        ann_inc = t.income_stmt
+        if ann_inc is not None and not ann_inc.empty:
+            for col, candidates in _INCOME_ROWS.items():
+                ann_row = _first_row(ann_inc, candidates)
                 if ann_row is not None:
-                    ann_rev = ann_row.sort_index().dropna()
-                    ann_rev.index = pd.to_datetime(ann_rev.index)
-                    ttm_valid = rows["ttm_revenue"].dropna()
-                    ttm_start = ttm_valid.index.min() if not ttm_valid.empty else pd.Timestamp.max
-                    ann_early = ann_rev[ann_rev.index < ttm_start]
-                    if not ann_early.empty:
-                        rows["ttm_revenue"] = pd.concat(
-                            [ann_early, rows["ttm_revenue"]]
-                        ).sort_index()
-        except Exception as exc:
-            logger.warning("%s: could not extend TTM with annual data: %s", ticker, exc)
+                    _extend_backward(rows, col, ann_row)
+            # Also try to extend ttm_ebitda directly (annual stmt often has it)
+            ann_ebitda = _first_row(ann_inc, ["EBITDA", "Normalized EBITDA"])
+            if ann_ebitda is not None and "ttm_ebitda" not in rows:
+                _extend_backward(rows, "ttm_ebitda", ann_ebitda)
+            elif ann_ebitda is not None:
+                _extend_backward(rows, "ttm_ebitda", ann_ebitda)
+    except Exception as exc:
+        logger.warning("%s: could not extend income stmt with annual data: %s", ticker, exc)
+
+    # Annual cash-flow statement → extend FCF
+    try:
+        ann_cf = t.cashflow
+        if ann_cf is not None and not ann_cf.empty:
+            ann_op_cf = _first_row(ann_cf, _CF_ROWS["ttm_op_cf"])
+            ann_capex = _first_row(ann_cf, _CF_ROWS["ttm_capex"])
+            if ann_op_cf is not None:
+                _extend_backward(rows, "ttm_op_cf", ann_op_cf)
+            if ann_op_cf is not None and ann_capex is not None:
+                ann_fcf = ann_op_cf.sort_index() + ann_capex.sort_index()
+                _extend_backward(rows, "ttm_fcf", ann_fcf.dropna())
+    except Exception as exc:
+        logger.warning("%s: could not extend CF with annual data: %s", ticker, exc)
+
+    # Annual balance sheet → extend shares, debt, cash (most critical for EV)
+    try:
+        ann_bs = t.balance_sheet
+        if ann_bs is not None and not ann_bs.empty:
+            for col, candidates in _BS_ROWS.items():
+                ann_row = _first_row(ann_bs, candidates)
+                if ann_row is not None:
+                    _extend_backward(rows, col, ann_row)
+    except Exception as exc:
+        logger.warning("%s: could not extend balance sheet with annual data: %s", ticker, exc)
 
     df = pd.DataFrame(rows)
     df.index = pd.to_datetime(df.index)

@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 # ── Path setup (allow running from repo root or app/ directory) ──────────────
@@ -22,16 +23,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data_sources.assembler import build_panel
+from data_sources.byod import load_byod, validate_byod, REQUIRED_COLS as BYOD_REQUIRED_COLS
 from transforms.compute_ev import ensure_ev
 from transforms.compute_forward_metrics import (
     ALL_METRICS,
-    MULTIPLE_LABELS,
     YIELD_METRIC_LABELS,
     compute_valuation_yields,
 )
 from transforms.compute_cagr import compute_forward_cagr
 from transforms.winsor import winsorise_panel, get_winsor_bounds
-from models.regression import run_all_metrics
+from models.regression import run_all_metrics, RegressionResult
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,12 +66,17 @@ def load_panel(
     start: str,
     end: str,
     byod_bytes: bytes | None,
+    byod_filename: str | None,
     freq: str,
 ) -> pd.DataFrame:
     """Cached panel build (re-runs only when inputs change)."""
     byod_path = None
     if byod_bytes is not None:
-        tmp = OUTPUT_DIR / "_byod_upload.csv"
+        # Preserve the original file extension so load_byod picks the right reader
+        suffix = Path(byod_filename).suffix.lower() if byod_filename else ".csv"
+        if suffix not in {".csv", ".xlsx", ".xls"}:
+            suffix = ".csv"
+        tmp = OUTPUT_DIR / f"_byod_upload{suffix}"
         tmp.write_bytes(byod_bytes)
         byod_path = str(tmp)
     return build_panel(list(tickers), start, end, byod_path=byod_path, freq=freq)
@@ -135,95 +141,60 @@ def scatter_plot(
     basket: list[str],
     market: str,
     metric: str,
-    basket_agg: str = "points",
     show_regression: bool = True,
-    highlight_current: bool = True,
     reg_result=None,
 ) -> go.Figure:
     """
-    Scatter: X = fwd_cagr_3y, Y = metric yield.
+    Snapshot scatter: one point per ticker at its latest available date.
+    X = fwd_cagr_3y, Y = metric yield.  Ticker labels shown on chart.
     """
     fig = go.Figure()
     x_col = "fwd_cagr_3y"
+    basket_tickers = [t for t in basket if t != primary]
 
-    def add_scatter(subset, name, color, symbol="circle", size=7, opacity=0.55):
-        sub = subset[[x_col, metric, "date"]].dropna()
-        if sub.empty:
+    def _add_group(tickers, color, symbol, size, group_name):
+        xs, ys, labels, hover = [], [], [], []
+        for ticker in tickers:
+            sub = panel[panel["ticker"] == ticker].dropna(subset=[x_col, metric])
+            if sub.empty:
+                continue
+            row = sub.iloc[-1]
+            xs.append(row[x_col] * 100)
+            ys.append(row[metric] * 100)
+            labels.append(ticker)
+            hover.append(row["date"].strftime("%Y-%m-%d"))
+        if not xs:
             return
         fig.add_trace(
             go.Scatter(
-                x=sub[x_col] * 100,
-                y=sub[metric] * 100,
-                mode="markers",
-                name=name,
-                marker=dict(color=color, size=size, symbol=symbol, opacity=opacity),
-                customdata=sub[["date"]].values,
+                x=xs, y=ys,
+                mode="markers+text",
+                name=group_name,
+                text=labels,
+                textposition="top center",
+                textfont=dict(size=11),
+                marker=dict(color=color, size=size, symbol=symbol),
+                customdata=list(zip(labels, hover)),
                 hovertemplate=(
-                    f"<b>{name}</b><br>"
-                    "Date: %{customdata[0]|%Y-%m-%d}<br>"
-                    f"CAGR: %{{x:.2f}}%<br>{YIELD_METRIC_LABELS.get(metric, metric)}: %{{y:.2f}}%<extra></extra>"
+                    "<b>%{customdata[0]}</b><br>"
+                    "Date: %{customdata[1]}<br>"
+                    f"CAGR: %{{x:.2f}}%<br>"
+                    f"{YIELD_METRIC_LABELS.get(metric, metric)}: %{{y:.2f}}%<extra></extra>"
                 ),
             )
         )
 
-    # Basket
-    basket_tickers = [t for t in basket if t != primary]
-    basket_data = panel[panel["ticker"].isin(basket_tickers)]
+    _add_group(basket_tickers,  _COLORS["basket"],   "diamond", 10, "Basket")
+    _add_group([market],        _COLORS["market"],   "square",  10, f"Market ({market})")
+    _add_group([primary],       _COLORS["security"], "star",    16, primary)
 
-    if basket_agg == "points":
-        add_scatter(basket_data, "Basket", _COLORS["basket"], symbol="diamond", size=6)
-    elif basket_agg in ("median", "mean"):
-        agg_fn = basket_data.groupby("date")[[x_col, metric]].median if basket_agg == "median" \
-            else basket_data.groupby("date")[[x_col, metric]].mean
-        agg = agg_fn().reset_index()
-        fig.add_trace(
-            go.Scatter(
-                x=agg[x_col] * 100, y=agg[metric] * 100,
-                mode="markers+lines",
-                name=f"Basket {basket_agg.capitalize()}",
-                marker=dict(color=_COLORS["basket"], size=7, symbol="diamond"),
-                line=dict(color=_COLORS["basket"], width=1, dash="dot"),
-                hovertemplate=(
-                    f"<b>Basket {basket_agg}</b><br>Date: %{{customdata}}<br>"
-                    f"CAGR: %{{x:.2f}}%<br>{YIELD_METRIC_LABELS.get(metric, metric)}: %{{y:.2f}}%<extra></extra>"
-                ),
-                customdata=agg["date"].dt.strftime("%Y-%m-%d").values,
-            )
-        )
-
-    # Market
-    mkt_data = panel[panel["ticker"] == market]
-    add_scatter(mkt_data, f"Market ({market})", _COLORS["market"], symbol="square", size=6)
-
-    # Security history
-    sec_data = panel[panel["ticker"] == primary]
-    add_scatter(sec_data, f"{primary} (history)", _COLORS["security"], symbol="circle", size=8, opacity=0.7)
-
-    # Highlight current (latest) point for primary
-    if highlight_current:
-        latest = sec_data.dropna(subset=[x_col, metric])
-        if not latest.empty:
-            cur = latest.iloc[-1]
-            fig.add_trace(
-                go.Scatter(
-                    x=[cur[x_col] * 100], y=[cur[metric] * 100],
-                    mode="markers",
-                    name=f"{primary} (latest)",
-                    marker=dict(color=_COLORS["current"], size=14, symbol="star"),
-                    hovertemplate=(
-                        f"<b>{primary} LATEST</b><br>"
-                        f"Date: {cur['date'].strftime('%Y-%m-%d')}<br>"
-                        f"CAGR: {cur[x_col]*100:.2f}%<br>"
-                        f"{YIELD_METRIC_LABELS.get(metric, metric)}: {cur[metric]*100:.2f}%<extra></extra>"
-                    ),
-                )
-            )
-
-    # Regression line
+    # Regression line (fitted on full basket history)
     if show_regression and reg_result is not None:
-        all_data = panel[panel["ticker"].isin(basket + [market])].dropna(subset=[x_col, metric])
-        if not all_data.empty:
-            x_range = np.linspace(all_data[x_col].min(), all_data[x_col].max(), 100)
+        ref_data = panel[
+            panel["ticker"].isin(basket_tickers + [market])
+        ].dropna(subset=[x_col, metric])
+        if not ref_data.empty:
+            x_range = np.linspace(ref_data[x_col].min(), ref_data[x_col].max(), 100)
             y_line  = reg_result.alpha + reg_result.beta * x_range
             fig.add_trace(
                 go.Scatter(
@@ -237,7 +208,7 @@ def scatter_plot(
 
     fig.update_layout(
         title=dict(
-            text=f"{YIELD_METRIC_LABELS.get(metric, metric)} vs 3Y Fwd Revenue CAGR",
+            text=f"{YIELD_METRIC_LABELS.get(metric, metric)} vs 3Y Fwd Revenue CAGR — Current Snapshot",
             font=dict(size=16),
         ),
         xaxis=dict(title="3-Year Forward Revenue CAGR (%)", ticksuffix="%", gridcolor="#e5e7eb"),
@@ -251,72 +222,247 @@ def scatter_plot(
     return fig
 
 
-def premium_timeseries_plot(
-    preds_df: pd.DataFrame,
+def basket_timeseries_plot(
+    panel: pd.DataFrame,
     primary: str,
+    basket: list[str],
+    market: str,
     metric: str,
+    basket_agg: str = "mean",
 ) -> go.Figure:
-    """Premium/discount time series for the primary security."""
+    """
+    Time-series of basket-average yield (mean or median) and primary security
+    yield over the full history.
+    """
     fig = go.Figure()
+    basket_tickers = [t for t in basket if t != primary]
 
-    data = preds_df.dropna(subset=["premium_yield", "date"])
-
-    # Shade positive (expensive) vs negative (cheap) regions
-    fig.add_hline(y=0, line=dict(color="black", width=1.5))
-
-    # Premium area
-    pos = data["premium_yield"].clip(lower=0) * 100
-    neg = data["premium_yield"].clip(upper=0) * 100
-
-    fig.add_trace(
-        go.Scatter(
-            x=data["date"], y=pos, fill="tozeroy",
-            fillcolor="rgba(239,68,68,0.15)", line=dict(width=0),
-            name="Rich vs regression", showlegend=True,
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=data["date"], y=neg, fill="tozeroy",
-            fillcolor="rgba(22,163,74,0.15)", line=dict(width=0),
-            name="Cheap vs regression", showlegend=True,
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=data["date"], y=data["premium_yield"] * 100,
-            mode="lines",
-            name="Premium (actual − predicted)",
-            line=dict(color=_COLORS["security"], width=2),
-            hovertemplate="Date: %{x|%Y-%m-%d}<br>Premium: %{y:.2f}%<extra></extra>",
-        )
-    )
-
-    # 1-sigma bands
-    sig = data["premium_yield"].std() * 100
-    mu  = data["premium_yield"].mean() * 100
-    for k, style in [(1, "dot"), (2, "dash")]:
-        for sign, lbl in [(1, f"+{k}σ"), (-1, f"-{k}σ")]:
-            fig.add_hline(
-                y=mu + sign * k * sig,
-                line=dict(color="gray", width=1, dash=style),
-                annotation_text=lbl,
-                annotation_position="right",
+    # Basket aggregate over time
+    basket_data = panel[panel["ticker"].isin(basket_tickers)]
+    if not basket_data.empty and metric in basket_data.columns:
+        grp = basket_data.groupby("date")[metric]
+        agg_series = grp.median() if basket_agg == "median" else grp.mean()
+        agg = agg_series.dropna().reset_index()
+        agg.columns = ["date", metric]
+        if not agg.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=agg["date"],
+                    y=agg[metric] * 100,
+                    mode="lines",
+                    name=f"Basket {basket_agg.capitalize()}",
+                    line=dict(color=_COLORS["basket"], width=2),
+                    hovertemplate=(
+                        "Date: %{x|%Y-%m-%d}<br>"
+                        f"Basket {basket_agg}: %{{y:.2f}}%<extra></extra>"
+                    ),
+                )
             )
+
+    # Primary security
+    sec = panel[panel["ticker"] == primary].dropna(subset=[metric])
+    if not sec.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=sec["date"],
+                y=sec[metric] * 100,
+                mode="lines",
+                name=primary,
+                line=dict(color=_COLORS["security"], width=2),
+                hovertemplate=(
+                    "Date: %{x|%Y-%m-%d}<br>"
+                    f"{primary}: %{{y:.2f}}%<extra></extra>"
+                ),
+            )
+        )
+
+    # Market proxy
+    mkt = panel[panel["ticker"] == market].dropna(subset=[metric])
+    if not mkt.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=mkt["date"],
+                y=mkt[metric] * 100,
+                mode="lines",
+                name=f"Market ({market})",
+                line=dict(color=_COLORS["market"], width=1.5, dash="dot"),
+                hovertemplate=(
+                    "Date: %{x|%Y-%m-%d}<br>"
+                    f"Market: %{{y:.2f}}%<extra></extra>"
+                ),
+            )
+        )
 
     fig.update_layout(
         title=dict(
-            text=f"{primary} – Premium/Discount on {YIELD_METRIC_LABELS.get(metric, metric)}",
+            text=f"{YIELD_METRIC_LABELS.get(metric, metric)} Over Time",
             font=dict(size=16),
         ),
         xaxis=dict(title="Date", gridcolor="#e5e7eb"),
-        yaxis=dict(title="Yield Spread (actual − predicted, %)", ticksuffix="%", gridcolor="#e5e7eb"),
+        yaxis=dict(
+            title=f"{YIELD_METRIC_LABELS.get(metric, metric)} (%)",
+            ticksuffix="%",
+            gridcolor="#e5e7eb",
+        ),
         legend=dict(orientation="h", y=-0.2),
+        hovermode="x unified",
         plot_bgcolor="white",
         paper_bgcolor="white",
         height=420,
     )
+    return fig
+
+
+def premium_timeseries_plot(
+    preds_df: pd.DataFrame,
+    primary: str,
+    metric: str,
+    cross_sec_df: pd.DataFrame | None = None,
+) -> go.Figure:
+    """
+    Two-row chart (shared x-axis):
+      Row 1 – Left axis:  Observed yield & Fair yield (regression line)
+               Right axis: Spread = observed − fair  (shaded + line)
+      Row 2 – Cross-sectional R² per period
+    """
+    metric_label = YIELD_METRIC_LABELS.get(metric, metric)
+    pred_col     = f"predicted_{metric}"
+    has_r2       = (
+        cross_sec_df is not None
+        and not cross_sec_df.empty
+        and "r2" in cross_sec_df.columns
+    )
+
+    fig = make_subplots(
+        rows=2 if has_r2 else 1,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.10,
+        row_heights=[0.65, 0.35] if has_r2 else [1.0],
+        specs=(
+            [[{"secondary_y": True}], [{"secondary_y": False}]]
+            if has_r2
+            else [[{"secondary_y": True}]]
+        ),
+        subplot_titles=(
+            [f"{primary} — {metric_label} | Fair vs Observed", "Cross-sectional R²"]
+            if has_r2
+            else [f"{primary} — {metric_label} | Fair vs Observed"]
+        ),
+    )
+
+    data = preds_df.dropna(subset=["date"])
+
+    # ── Row 1, left axis: Observed yield ─────────────────────────────────────
+    if metric in data.columns:
+        obs = data.dropna(subset=[metric])
+        fig.add_trace(
+            go.Scatter(
+                x=obs["date"], y=obs[metric] * 100,
+                mode="lines", name="Observed yield",
+                line=dict(color=_COLORS["security"], width=2),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Observed: %{y:.2f}%<extra></extra>",
+            ),
+            row=1, col=1, secondary_y=False,
+        )
+
+    # ── Row 1, left axis: Fair yield ─────────────────────────────────────────
+    if pred_col in data.columns:
+        fair = data.dropna(subset=[pred_col])
+        fig.add_trace(
+            go.Scatter(
+                x=fair["date"], y=fair[pred_col] * 100,
+                mode="lines", name="Fair yield (cross-sec regression)",
+                line=dict(color=_COLORS["regression"], width=2, dash="dash"),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Fair: %{y:.2f}%<extra></extra>",
+            ),
+            row=1, col=1, secondary_y=False,
+        )
+
+    # ── Row 1, right axis: Spread (observed − fair) ───────────────────────────
+    if "premium_yield" in data.columns:
+        prem = data.dropna(subset=["premium_yield"])
+        pos  = prem["premium_yield"].clip(lower=0) * 100
+        neg  = prem["premium_yield"].clip(upper=0) * 100
+
+        fig.add_trace(
+            go.Scatter(
+                x=prem["date"], y=pos, fill="tozeroy",
+                fillcolor="rgba(239,68,68,0.12)", line=dict(width=0),
+                name="Rich (obs > fair)", showlegend=True, hoverinfo="skip",
+            ),
+            row=1, col=1, secondary_y=True,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=prem["date"], y=neg, fill="tozeroy",
+                fillcolor="rgba(22,163,74,0.12)", line=dict(width=0),
+                name="Cheap (obs < fair)", showlegend=True, hoverinfo="skip",
+            ),
+            row=1, col=1, secondary_y=True,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=prem["date"], y=prem["premium_yield"] * 100,
+                mode="lines", name="Spread (obs − fair)",
+                line=dict(color="#6B7280", width=1.5),
+                hovertemplate=(
+                    "Date: %{x|%Y-%m-%d}<br>Spread: %{y:+.2f}%<extra></extra>"
+                ),
+            ),
+            row=1, col=1, secondary_y=True,
+        )
+
+    # ── Row 2: R² per period ──────────────────────────────────────────────────
+    if has_r2:
+        fig.add_trace(
+            go.Scatter(
+                x=cross_sec_df["date"], y=cross_sec_df["r2"],
+                mode="lines+markers", name="R² (cross-sec)",
+                line=dict(color=_COLORS["basket"], width=2),
+                marker=dict(size=5),
+                hovertemplate=(
+                    "Date: %{x|%Y-%m-%d}<br>R²: %{y:.3f}"
+                    "<br>n=%{customdata}<extra></extra>"
+                ),
+                customdata=cross_sec_df["n_obs"],
+            ),
+            row=2, col=1,
+        )
+        fig.add_hline(
+            y=0, line=dict(color="gray", width=1, dash="dot"), row=2, col=1
+        )
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    fig.update_layout(
+        hovermode="x unified",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=680 if has_r2 else 480,
+        legend=dict(orientation="h", y=-0.08),
+    )
+    fig.update_yaxes(
+        title_text=f"{metric_label} (%)",
+        ticksuffix="%",
+        gridcolor="#e5e7eb",
+        row=1, col=1, secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="Spread (%)",
+        ticksuffix="%",
+        gridcolor=None,
+        showgrid=False,
+        zeroline=True, zerolinecolor="#9ca3af", zerolinewidth=1,
+        row=1, col=1, secondary_y=True,
+    )
+    if has_r2:
+        fig.update_yaxes(
+            title_text="R²",
+            range=[0, 1],
+            gridcolor="#e5e7eb",
+            row=2, col=1,
+        )
+        fig.update_xaxes(title_text="Date", row=2, col=1)
     return fig
 
 
@@ -371,8 +517,54 @@ def main() -> None:
         st.markdown(
             "_Upload a Bloomberg CSV export. See `config/byod_template.csv` for schema._"
         )
-        byod_file = st.file_uploader("Upload BYOD CSV / Excel", type=["csv", "xlsx"])
-        byod_bytes = byod_file.read() if byod_file else None
+        byod_file  = st.file_uploader("Upload BYOD CSV / Excel", type=["csv", "xlsx"])
+        byod_bytes = None
+
+        if byod_file is not None:
+            byod_bytes = byod_file.read()
+            # ── Validate immediately and surface any issues ───────────────────
+            try:
+                _suffix = Path(byod_file.name).suffix
+                _tmp    = OUTPUT_DIR / f"_byod_check{_suffix}"
+                _tmp.write_bytes(byod_bytes)
+                _preview = load_byod(_tmp)
+                _issues  = validate_byod(_preview)
+                _tickers = sorted(_preview["ticker"].unique())
+                st.success(
+                    f"✓ BYOD loaded — {len(_tickers)} ticker(s), "
+                    f"{len(_preview)} rows  |  "
+                    f"{_preview['date'].min().date()} → {_preview['date'].max().date()}"
+                )
+                # Cross-reference BYOD tickers against sidebar universe
+                _byod_set     = set(_tickers)
+                _sidebar_set  = set([primary] + basket_list + [market])
+                _matched      = sorted(_byod_set & _sidebar_set)
+                _not_in_byod  = sorted(_sidebar_set - _byod_set)
+                _extra_byod   = sorted(_byod_set - _sidebar_set)
+                if _matched:
+                    st.caption(f"✓ Matched to sidebar (→ Tier 1): {', '.join(_matched)}")
+                if _not_in_byod:
+                    st.warning(
+                        f"⚠ Sidebar tickers **not** found in BYOD: "
+                        f"{', '.join(_not_in_byod)}  \n"
+                        "These will use Tier 3 (yfinance trailing). "
+                        "Check that ticker names match exactly (e.g. `AAPL`, not `AAPL US`)."
+                    )
+                if _extra_byod:
+                    st.caption(f"ℹ BYOD tickers not in current sidebar: {', '.join(_extra_byod)}")
+                for _w in _issues:
+                    if _w.startswith("ℹ"):
+                        st.caption(_w)
+                    else:
+                        st.warning(f"⚠ {_w}")
+            except Exception as _e:
+                st.error(f"❌ BYOD file error: {_e}")
+                st.info(
+                    f"Required columns: **{', '.join(BYOD_REQUIRED_COLS)}**  \n"
+                    "All other fundamental columns are optional. "
+                    "Column names are case-insensitive and spaces are converted to underscores."
+                )
+                byod_bytes = None   # don't pass bad file downstream
 
         st.divider()
         st.header("Settings")
@@ -385,8 +577,8 @@ def main() -> None:
         )
 
         basket_agg = st.selectbox(
-            "Basket display", ["points", "median", "mean"],
-            format_func=lambda v: {"points": "Individual points", "median": "Median per date", "mean": "Mean per date"}[v],
+            "Basket time-series aggregation", ["mean", "median"],
+            format_func=lambda v: {"mean": "Mean per date", "median": "Median per date"}[v],
         )
 
         show_reg     = st.toggle("Show regression line",  value=True)
@@ -437,6 +629,7 @@ def main() -> None:
                 str(start_date),
                 str(end_date),
                 byod_bytes,
+                byod_file.name if byod_file is not None else None,
                 freq,
             )
         except Exception as exc:
@@ -452,8 +645,12 @@ def main() -> None:
 
     # Tier info banner
     tiers = panel.drop_duplicates("ticker")[["ticker", "data_tier"]]
-    tier_rows = "  |  ".join(f"{r.ticker}: {tier_label(r.data_tier)}" for _, r in tiers.iterrows())
-    st.caption(f"Data tiers — {tier_rows}")
+    tier1_tickers = [r.ticker for _, r in tiers.iterrows() if r.data_tier == 1]
+    tier3_tickers = [r.ticker for _, r in tiers.iterrows() if r.data_tier == 3]
+    if tier1_tickers:
+        st.success(f"✓ Tier 1 — BYOD forward estimates: **{', '.join(tier1_tickers)}**")
+    if tier3_tickers:
+        st.info(f"▽ Tier 3 — yfinance trailing: **{', '.join(tier3_tickers)}**")
 
     # ── Regression ────────────────────────────────────────────────────────────
     basket_and_market = [t for t in all_tickers if t != primary]
@@ -473,8 +670,21 @@ def main() -> None:
         st.warning("Not enough data for regression. Try a wider date range or smaller min_obs.")
         return
 
-    reg_result  = results.get(metric, {}).get("reg")
-    preds_df    = results.get(metric, {}).get("predictions", security_panel)
+    reg_result   = results.get(metric, {}).get("reg")
+    cross_sec_df = results.get(metric, {}).get("cross_sec", pd.DataFrame())
+    preds_df     = results.get(metric, {}).get("predictions", security_panel)
+
+    # Build a RegressionResult from the latest cross-sec snapshot for the scatter
+    scatter_reg = reg_result  # fallback to pooled OLS
+    if cross_sec_df is not None and not cross_sec_df.empty:
+        cs_latest = cross_sec_df.iloc[-1]
+        scatter_reg = RegressionResult(
+            metric=metric, x_col="fwd_cagr_3y",
+            alpha=float(cs_latest["c"]),
+            beta=float(cs_latest["m"]),
+            r2=float(cs_latest["r2"]),
+            n_obs=int(cs_latest["n_obs"]),
+        )
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4 = st.tabs(
@@ -482,20 +692,29 @@ def main() -> None:
     )
 
     with tab1:
-        st.subheader(f"{YIELD_METRIC_LABELS.get(metric, metric)} — Scatter")
+        st.subheader(f"{YIELD_METRIC_LABELS.get(metric, metric)} — Current Snapshot")
         fig_scatter = scatter_plot(
             panel, primary, basket_list + [market], market,
-            metric, basket_agg=basket_agg,
-            show_regression=show_reg, reg_result=reg_result,
+            metric, show_regression=show_reg, reg_result=scatter_reg,
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-        if reg_result:
-            cols = st.columns(4)
-            cols[0].metric("R²",    f"{reg_result.r2:.3f}")
-            cols[1].metric("α (intercept)", f"{reg_result.alpha:.4f}")
-            cols[2].metric("β (slope)",     f"{reg_result.beta:.4f}")
-            cols[3].metric("Obs",   str(reg_result.n_obs))
+        if scatter_reg:
+            src = "latest cross-sec" if (cross_sec_df is not None and not cross_sec_df.empty) else "pooled OLS"
+            cols = st.columns(5)
+            cols[0].metric("R² (latest)", f"{scatter_reg.r2:.3f}")
+            cols[1].metric("c (intercept)", f"{scatter_reg.alpha:.4f}")
+            cols[2].metric("m (slope)",     f"{scatter_reg.beta:.4f}")
+            cols[3].metric("n (tickers)",   str(scatter_reg.n_obs))
+            if cross_sec_df is not None and not cross_sec_df.empty:
+                cols[4].metric("Mean R² (all periods)", f"{cross_sec_df['r2'].mean():.3f}")
+            st.caption(f"Regression source: {src}")
+
+        st.subheader(f"{YIELD_METRIC_LABELS.get(metric, metric)} — History")
+        fig_ts = basket_timeseries_plot(
+            panel, primary, basket_list, market, metric, basket_agg=basket_agg,
+        )
+        st.plotly_chart(fig_ts, use_container_width=True)
 
         # Rolling R² chart
         rolling_df = results.get(metric, {}).get("rolling")
@@ -517,9 +736,12 @@ def main() -> None:
                 st.plotly_chart(fig_roll, use_container_width=True)
 
     with tab2:
-        st.subheader(f"{primary} — Premium / Discount on {YIELD_METRIC_LABELS.get(metric, metric)}")
+        st.subheader(f"{primary} — Fair vs Observed | {YIELD_METRIC_LABELS.get(metric, metric)}")
         if preds_df is not None and "premium_yield" in preds_df.columns:
-            fig_prem = premium_timeseries_plot(preds_df, primary, metric)
+            fig_prem = premium_timeseries_plot(
+                preds_df, primary, metric,
+                cross_sec_df=cross_sec_df if cross_sec_df is not None and not cross_sec_df.empty else None,
+            )
             st.plotly_chart(fig_prem, use_container_width=True)
 
             # Latest premium table
@@ -546,35 +768,37 @@ def main() -> None:
 
             display_cols = {
                 "metric_label":             "Metric",
-                "r2":                       "R²",
-                "alpha":                    "α",
-                "beta":                     "β",
-                "n_obs":                    "Obs",
-                "latest_actual_yield":      "Actual yield",
-                "latest_predicted_yield":   "Pred yield",
-                "latest_premium_yield":     "Premium (yld)",
-                "latest_premium_pct":       "Premium (%)",
+                "r2":                       "Mean R²",
+                "c_latest":                 "c (intercept)",
+                "m_latest":                 "m (slope)",
+                "x_latest":                 "x (CAGR)",
+                "n_obs":                    "n (tickers)",
+                "latest_actual_yield":      "Observed yield",
+                "latest_predicted_yield":   "Fair yield",
+                "latest_premium_yield":     "Spread (obs−fair)",
+                "latest_premium_pct":       "Spread (%)",
                 "latest_premium_zscore":    "Z-score",
-                "latest_actual_multiple":   "Actual mult",
-                "latest_predicted_multiple":"Pred mult",
-                "latest_premium_multiple":  "Premium mult (%)",
+                "latest_actual_multiple":   "Obs multiple",
+                "latest_predicted_multiple":"Fair multiple",
+                "latest_premium_multiple":  "Mult spread (%)",
             }
             sdf = sdf.rename(columns=display_cols)
             show_cols = [v for v in display_cols.values() if v in sdf.columns]
             st.dataframe(
                 sdf[show_cols].style.format(
                     {
-                        "R²":              "{:.3f}",
-                        "α":               "{:.5f}",
-                        "β":               "{:.4f}",
-                        "Actual yield":    "{:.4f}",
-                        "Pred yield":      "{:.4f}",
-                        "Premium (yld)":   "{:+.4f}",
-                        "Premium (%)":     "{:+.2f}",
-                        "Z-score":         "{:+.2f}",
-                        "Actual mult":     "{:.1f}",
-                        "Pred mult":       "{:.1f}",
-                        "Premium mult (%)":"{:+.1f}",
+                        "Mean R²":          "{:.3f}",
+                        "c (intercept)":    "{:.5f}",
+                        "m (slope)":        "{:.4f}",
+                        "x (CAGR)":         "{:.4f}",
+                        "Observed yield":   "{:.4f}",
+                        "Fair yield":       "{:.4f}",
+                        "Spread (obs−fair)":"{:+.4f}",
+                        "Spread (%)":       "{:+.2f}",
+                        "Z-score":          "{:+.2f}",
+                        "Obs multiple":     "{:.1f}",
+                        "Fair multiple":    "{:.1f}",
+                        "Mult spread (%)":  "{:+.1f}",
                     },
                     na_rep="–",
                 ),

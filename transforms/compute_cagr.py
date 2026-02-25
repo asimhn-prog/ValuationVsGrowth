@@ -1,31 +1,39 @@
 """
-Compute 3-year forward revenue CAGR.
+Compute revenue CAGR (3-year preferred, with 2Y/1Y fallback).
 
-Definition
-----------
+Tier-1 (forward estimates)
+--------------------------
   3Y Forward CAGR = (fwd_revenue_4y / fwd_revenue_1y) ^ (1/3) - 1
 
-  Where:
-    fwd_revenue_1y  = 1-year forward (NTM) revenue consensus   [FY+1]
-    fwd_revenue_4y  = 4-year forward revenue consensus          [FY+4]
+  T_0 = fwd_revenue_1y (NTM, FY+1)
+  T_3 = fwd_revenue_4y (FY+4)
+  Annualises revenue growth over exactly 3 forward years.
 
-  This annualises the revenue growth from FY+1 to FY+4 – exactly 3 years
-  of forward growth – which is the cleanest definition consistent with the
-  X-axis label "3-year forward revenue CAGR".
+Tier-3 fallback (trailing TTM)
+-------------------------------
+  When forward estimates are unavailable we use trailing TTM revenue history,
+  working from the most-recent observation (T_0) backward:
 
-Tier-3 fallback
----------------
-  When forward revenue is unavailable, we fall back to the 3-year *trailing*
-  revenue CAGR computed from TTM revenue history.  This is a lagging proxy –
-  it reflects where growth *has been*, not where analysts expect it to go.
-  It is labelled clearly as a Tier-3 approximation.
+    3Y CAGR  = (rev_t / rev_{t-36m}) ^ (1/3) - 1   [preferred]
+    2Y CAGR  = (rev_t / rev_{t-24m}) ^ (1/2) - 1   [if < 36 months available]
+    1Y CAGR  = (rev_t / rev_{t-12m}) ^ (1/1) - 1   [last resort]
 
-  Formula (trailing): (ttm_revenue_t / ttm_revenue_{t-36months}) ^ (1/3) - 1
+  The horizon actually used is recorded in ``fwd_cagr_years`` (3, 2, or 1).
+
+Mixed-tier handling
+-------------------
+  When the panel contains both Tier-1 (BYOD forward) and Tier-3 (yfinance
+  trailing) rows, CAGR is computed **per row**:
+    1. Forward CAGR is applied to any row that has valid fwd_revenue_1y AND
+       fwd_revenue_4y.
+    2. Trailing CAGR (3Y→2Y→1Y fallback) is then computed for rows still
+       NaN, using ttm_revenue history per ticker.
+  This ensures basket tickers (Tier 3) get a valid CAGR even when the primary
+  is Tier 1 with forward estimates.
 
 NaN handling
 ------------
-  Any row where fwd_revenue_1y ≤ 0, fwd_revenue_4y ≤ 0, or either is NaN
-  produces NaN for fwd_cagr_3y.
+  Rows where either revenue value is ≤ 0 or NaN produce NaN for fwd_cagr_3y.
 """
 
 import logging
@@ -40,9 +48,12 @@ _N_YEARS = 3
 
 def compute_forward_cagr(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add ``fwd_cagr_3y`` and ``fwd_cagr_tier`` columns to the panel.
+    Add ``fwd_cagr_3y``, ``fwd_cagr_years``, and ``fwd_cagr_tier`` columns
+    to the panel.
 
     The panel must be sorted by (ticker, date) and have a 'date' column.
+    Mixed-tier panels (Tier 1 + Tier 3 rows) are handled correctly: forward
+    CAGR is used per row where available; trailing CAGR fills the rest.
 
     Parameters
     ----------
@@ -52,74 +63,91 @@ def compute_forward_cagr(df: pd.DataFrame) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame  Copy with additional columns:
-                    fwd_cagr_3y   – annualised 3-year revenue CAGR
-                    fwd_cagr_tier – 1 (forward) or 3 (trailing proxy)
+                    fwd_cagr_3y    – annualised revenue CAGR
+                    fwd_cagr_years – horizon used (3, 2, or 1)
+                    fwd_cagr_tier  – 1 (forward) or 3 (trailing proxy)
     """
-    df = df.copy()
+    df = df.copy().sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    has_fwd = (
+    n = len(df)
+    cagr_arr = np.full(n, np.nan)
+    year_arr = np.full(n, np.nan)
+    tier_arr = np.full(n, np.nan)
+
+    # ── Step 1: Forward CAGR (row-by-row) ────────────────────────────────────
+    has_fwd_cols = (
         "fwd_revenue_1y" in df.columns
         and "fwd_revenue_4y" in df.columns
-        and df["fwd_revenue_1y"].notna().any()
-        and df["fwd_revenue_4y"].notna().any()
     )
-
-    if has_fwd:
-        # ── Tier 1: forward CAGR ─────────────────────────────────────────────
-        r1 = df["fwd_revenue_1y"]
-        r4 = df["fwd_revenue_4y"]
-        valid = (r1 > 0) & (r4 > 0) & r1.notna() & r4.notna()
-        df["fwd_cagr_3y"] = np.where(
-            valid, (r4 / r1) ** (1.0 / _N_YEARS) - 1, np.nan
-        )
-        df["fwd_cagr_tier"] = np.where(valid, 1, np.nan)
-        n_inv = (~valid).sum()
-        if n_inv:
-            logger.warning(
-                "%d rows have invalid forward revenue for CAGR (set to NaN).", n_inv
+    if has_fwd_cols:
+        r1 = df["fwd_revenue_1y"].values.astype(float)
+        r4 = df["fwd_revenue_4y"].values.astype(float)
+        valid_fwd = (r1 > 0) & (r4 > 0) & np.isfinite(r1) & np.isfinite(r4)
+        cagr_arr = np.where(valid_fwd, (r4 / r1) ** (1.0 / _N_YEARS) - 1, cagr_arr)
+        year_arr = np.where(valid_fwd, float(_N_YEARS), year_arr)
+        tier_arr = np.where(valid_fwd, 1.0, tier_arr)
+        n_fwd = int(valid_fwd.sum())
+        if n_fwd:
+            logger.info(
+                "fwd_cagr_3y: %d rows using Tier-1 (forward estimates).", n_fwd
             )
-        logger.info("fwd_cagr_3y: Tier 1 (forward estimates).")
 
-    elif "ttm_revenue" in df.columns and df["ttm_revenue"].notna().any():
-        # ── Tier 3: trailing CAGR ────────────────────────────────────────────
+    # ── Step 2: Trailing CAGR for rows still NaN ─────────────────────────────
+    still_nan_mask = np.isnan(cagr_arr)
+    has_ttm = "ttm_revenue" in df.columns and df["ttm_revenue"].notna().any()
+
+    if has_ttm and still_nan_mask.any():
         logger.info(
-            "fwd_cagr_3y: Tier-3 proxy using 3Y trailing TTM revenue CAGR."
+            "fwd_cagr_3y: filling %d rows with Tier-3 trailing CAGR "
+            "(3Y → 2Y → 1Y fallback).",
+            int(still_nan_mask.sum()),
         )
-        df = df.sort_values(["ticker", "date"]).copy()
-        lag_periods = 36  # 36 monthly periods ≈ 3 years
-
-        cagr_parts: list[pd.Series] = []
-        tier_parts: list[pd.Series] = []
-
         for ticker, grp in df.groupby("ticker", sort=False):
-            rev = grp["ttm_revenue"].values.astype(float)
-            idx = grp.index
-
-            if len(rev) <= lag_periods:
-                cagr_parts.append(pd.Series(np.nan, index=idx))
-                tier_parts.append(pd.Series(np.nan, index=idx))
+            idx  = grp.index.to_numpy()
+            # Only process tickers that still have at least one NaN CAGR row
+            if not still_nan_mask[idx].any():
                 continue
 
-            rev_lag   = np.full_like(rev, np.nan)
-            rev_lag[lag_periods:] = rev[:-lag_periods]
+            rev = grp["ttm_revenue"].values.astype(float)
+            m   = len(rev)
 
-            valid  = (rev > 0) & (rev_lag > 0)
-            cagr   = np.where(
-                valid, (rev / rev_lag) ** (1.0 / _N_YEARS) - 1, np.nan
-            )
-            tier   = np.where(~np.isnan(cagr), 3, np.nan)
+            local_cagr = cagr_arr[idx].copy()
+            local_year = year_arr[idx].copy()
 
-            cagr_parts.append(pd.Series(cagr, index=idx))
-            tier_parts.append(pd.Series(tier, index=idx))
+            for lag_periods, n_years in [(36, 3), (24, 2), (12, 1)]:
+                if m <= lag_periods:
+                    continue
+                rev_lag = np.full(m, np.nan)
+                rev_lag[lag_periods:] = rev[: m - lag_periods]
+                fill = (
+                    np.isnan(local_cagr)
+                    & (rev > 0) & np.isfinite(rev)
+                    & (rev_lag > 0) & np.isfinite(rev_lag)
+                )
+                local_cagr = np.where(
+                    fill, (rev / rev_lag) ** (1.0 / n_years) - 1, local_cagr
+                )
+                local_year = np.where(fill, float(n_years), local_year)
 
-        df["fwd_cagr_3y"]   = pd.concat(cagr_parts).sort_index()
-        df["fwd_cagr_tier"] = pd.concat(tier_parts).sort_index()
+            # Mark newly filled rows as Tier 3
+            newly_filled = ~np.isnan(local_cagr) & np.isnan(tier_arr[idx])
+            local_tier = np.where(newly_filled, 3.0, tier_arr[idx])
 
-    else:
+            cagr_arr[idx] = local_cagr
+            year_arr[idx] = local_year
+            tier_arr[idx] = local_tier
+
+        n_t3 = int((tier_arr == 3.0).sum())
+        if n_t3:
+            logger.info("fwd_cagr_3y: %d rows using Tier-3 trailing CAGR.", n_t3)
+
+    if np.isnan(cagr_arr).all():
         logger.warning(
             "Neither forward nor trailing revenue found; fwd_cagr_3y = NaN."
         )
-        df["fwd_cagr_3y"]   = np.nan
-        df["fwd_cagr_tier"] = np.nan
+
+    df["fwd_cagr_3y"]    = cagr_arr
+    df["fwd_cagr_years"] = year_arr
+    df["fwd_cagr_tier"]  = tier_arr
 
     return df

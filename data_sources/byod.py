@@ -49,16 +49,22 @@ REQUIRED_COLS: list[str] = [
     "ticker",
     "price",
     "shares_outstanding",
+    "fwd_revenue_1y",
+]
+
+# All other fundamental columns are optional; metrics that need a missing column
+# will produce NaN for that metric rather than failing entirely.
+OPTIONAL_COLS: list[str] = [
     "total_debt",
     "cash",
     "fwd_eps_1y",
-    "fwd_revenue_1y",
     "fwd_ebitda_1y",
     "fwd_fcf_1y",
-    "fwd_revenue_4y",
+    "fwd_revenue_4y",   # needed for 3Y fwd CAGR; falls back to TTM if absent
+    "market_cap",
+    "enterprise_value",
+    "currency",
 ]
-
-OPTIONAL_COLS: list[str] = ["market_cap", "enterprise_value", "currency"]
 
 _NUMERIC_COLS: list[str] = [
     c for c in REQUIRED_COLS + OPTIONAL_COLS
@@ -174,19 +180,36 @@ def validate_byod(df: pd.DataFrame) -> list[str]:
     -------
     list[str]
         Warning messages; empty list means no issues detected.
+        Only REQUIRED_COLS trigger NaN warnings.  Optional columns that are
+        absent or all-NaN are silently skipped (they simply won't power the
+        corresponding metric).
     """
     warnings: list[str] = []
 
+    # Required columns: flag if missing or >50% NaN
     for col in REQUIRED_COLS:
         if col not in df.columns:
-            warnings.append(f"MISSING required column: {col}")
+            warnings.append(f"MISSING required column: '{col}'")
             continue
         if col in _NUMERIC_COLS:
             pct_null = df[col].isna().mean() * 100
             if pct_null > 50:
                 warnings.append(
-                    f"'{col}' is {pct_null:.1f}% NaN – check Bloomberg export."
+                    f"Required column '{col}' is {pct_null:.1f}% NaN – "
+                    "check your export."
                 )
+
+    # Optional columns: note which are present (informational, not a warning)
+    present_optional = [
+        c for c in OPTIONAL_COLS
+        if c in df.columns and c not in ("market_cap", "enterprise_value", "currency")
+        and df[c].notna().any()
+    ]
+    if present_optional:
+        warnings.append(
+            f"ℹ Optional columns found (will be used where available): "
+            f"{', '.join(present_optional)}"
+        )
 
     for col in ["fwd_revenue_1y", "fwd_revenue_4y"]:
         if col in df.columns:
