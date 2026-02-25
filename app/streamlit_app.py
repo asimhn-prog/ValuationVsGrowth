@@ -652,6 +652,49 @@ def main() -> None:
     if tier3_tickers:
         st.info(f"▽ Tier 3 — yfinance trailing: **{', '.join(tier3_tickers)}**")
 
+    # ── Data quality diagnostic ───────────────────────────────────────────────
+    with st.expander("🔍 Data diagnostic (click to inspect if charts are blank)"):
+        diag_cols = ["fwd_cagr_3y"] + ALL_METRICS
+        rows_diag = []
+        for tkr in all_tickers:
+            sub = panel[panel["ticker"] == tkr]
+            tier_val = sub["data_tier"].iloc[0] if not sub.empty else "?"
+            row_d = {"Ticker": tkr, "Tier": int(tier_val) if not pd.isna(tier_val) else "?",
+                     "Rows": len(sub)}
+            for col in diag_cols:
+                if col in sub.columns:
+                    nn = sub[col].notna().sum()
+                    latest = sub[col].dropna().iloc[-1] if nn > 0 else None
+                    row_d[f"{col} (non-NaN)"] = nn
+                    row_d[f"{col} (latest)"] = f"{latest*100:.2f}%" if latest is not None else "NaN"
+                else:
+                    row_d[f"{col} (non-NaN)"] = "col missing"
+                    row_d[f"{col} (latest)"] = "col missing"
+            rows_diag.append(row_d)
+        st.dataframe(pd.DataFrame(rows_diag), use_container_width=True)
+
+        # Intermediate column coverage per ticker
+        inter_cols = ["shares_outstanding", "market_cap", "enterprise_value", "ttm_revenue"]
+        rows_inter = []
+        for tkr in all_tickers:
+            sub = panel_raw[panel_raw["ticker"] == tkr]
+            r = {"Ticker": tkr}
+            for col in inter_cols:
+                if col in sub.columns:
+                    nn = sub[col].notna().sum()
+                    r[f"{col} (non-NaN)"] = f"{nn}/{len(sub)}"
+                else:
+                    r[f"{col} (non-NaN)"] = "missing"
+            rows_inter.append(r)
+        st.caption("**Intermediate columns (raw panel before transforms):**")
+        st.dataframe(pd.DataFrame(rows_inter), use_container_width=True)
+
+        fwd_cols = [c for c in panel.columns if c.startswith("fwd_")]
+        ttm_cols = [c for c in panel.columns if c.startswith("ttm_")]
+        st.caption(f"fwd_* columns: {fwd_cols}")
+        st.caption(f"ttm_* columns: {ttm_cols}")
+        st.caption(f"enterprise_value non-NaN: {panel['enterprise_value'].notna().sum()} / {len(panel)}")
+
     # ── Regression ────────────────────────────────────────────────────────────
     basket_and_market = [t for t in all_tickers if t != primary]
     basket_panel   = panel[panel["ticker"].isin(basket_and_market)]

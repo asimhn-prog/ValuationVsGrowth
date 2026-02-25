@@ -134,9 +134,10 @@ def load_byod(path: Union[str, Path]) -> pd.DataFrame:
         df["market_cap"] = df["price"] * df["shares_outstanding"]
 
     if "enterprise_value" not in df.columns:
-        df["enterprise_value"] = (
-            df["market_cap"] + df["total_debt"] - df["cash"]
-        )
+        # total_debt and cash are optional; treat as 0 if absent
+        td = df["total_debt"].fillna(0) if "total_debt" in df.columns else 0
+        ca = df["cash"].fillna(0) if "cash" in df.columns else 0
+        df["enterprise_value"] = df["market_cap"] + td - ca
 
     # ── Guard: non-positive EV / price ───────────────────────────────────────
     bad_ev = df["enterprise_value"] <= 0

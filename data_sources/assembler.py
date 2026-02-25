@@ -110,6 +110,16 @@ def _build_tier3_panel(
 
     keep = [c for c in _YF_TRAIL_COLS if c in trail.columns]
     merged = base.join(trail[keep], how="left").ffill()
+
+    # Backfill balance-sheet stock items so the full date range is covered.
+    # Annual extension in fetch_trailing_fundamentals may not reach far enough
+    # back; bfill propagates the earliest known value to earlier months.
+    # Flow items (ttm_revenue etc.) are NOT backfilled – they would give a
+    # flat/zero CAGR rather than a meaningful estimate.
+    stock_cols = [c for c in ["shares_outstanding", "total_debt", "cash"] if c in merged.columns]
+    if stock_cols:
+        merged[stock_cols] = merged[stock_cols].bfill()
+
     return merged
 
 

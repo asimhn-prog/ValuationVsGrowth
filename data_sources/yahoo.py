@@ -186,6 +186,14 @@ def fetch_trailing_fundamentals(
         logger.warning("No trailing fundamentals for %s", ticker)
         return pd.DataFrame()
 
+    # ── Normalise all quarterly series to TZ-naive ────────────────────────────
+    # yfinance may return TZ-aware column indices (e.g. America/New_York).
+    # Strip timezone so that annual extension comparisons don't fail.
+    for _k in list(rows.keys()):
+        _s = rows[_k]
+        if isinstance(_s.index, pd.DatetimeIndex) and _s.index.tz is not None:
+            rows[_k] = _s.set_axis(_s.index.tz_localize(None))
+
     # ── Extend all series backward with annual data ───────────────────────────
     # yfinance quarterly statements only cover ~5 recent quarters.  Annual
     # statements (5 fiscal years) are used to fill earlier dates so that a
@@ -195,6 +203,9 @@ def fetch_trailing_fundamentals(
         """Prepend annual data points that pre-date the existing quarterly data."""
         ann_data = ann_series.sort_index().dropna()
         ann_data.index = pd.to_datetime(ann_data.index)
+        # Strip TZ so comparisons with the (now TZ-naive) quarterly data work
+        if ann_data.index.tz is not None:
+            ann_data.index = ann_data.index.tz_localize(None)
         existing = rows_dict.get(col, pd.Series(dtype=float))
         existing_valid = existing.dropna()
         cutoff = existing_valid.index.min() if not existing_valid.empty else pd.Timestamp.max
