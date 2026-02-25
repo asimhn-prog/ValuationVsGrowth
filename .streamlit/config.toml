@@ -1,0 +1,7 @@
+[server]
+maxUploadSize = 50          # MB – enough for large BYOD Excel files
+enableCORS = false
+enableXsrfProtection = true
+
+[theme]
+base = "light"
