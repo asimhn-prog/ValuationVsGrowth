@@ -764,6 +764,17 @@ def main() -> None:
 
     panel = run_pipeline(panel_raw, fcf_use_ev=fcf_use_ev, winsor_cfg=winsor_cfg)
 
+    # Warn about any requested tickers that are completely absent from the panel
+    panel_tickers = set(panel_raw["ticker"].unique())
+    missing_tickers = [t for t in all_tickers if t not in panel_tickers]
+    if missing_tickers:
+        st.warning(
+            f"⚠ Could not load price data for: **{', '.join(missing_tickers)}**  \n"
+            "These tickers will not appear in charts. Possible causes: yfinance rate "
+            "limiting, invalid ticker symbol, or no data for the selected date range.  \n"
+            "If you have a BYOD file, uploading it will provide price data for these tickers."
+        )
+
     # Tier info banner
     tiers = panel.drop_duplicates("ticker")[["ticker", "data_tier"]]
     tier1_tickers = [r.ticker for _, r in tiers.iterrows() if r.data_tier == 1]

@@ -185,10 +185,28 @@ def build_panel(
     panels: list[pd.DataFrame] = []
 
     for ticker in tickers_unique:
-        if ticker not in price_frames:
-            continue
+        px = price_frames.get(ticker)
 
-        px = price_frames[ticker]
+        # ── Tier-1 price fallback: if yfinance failed but BYOD has a price ──
+        # This covers Streamlit Cloud / rate-limited environments where yfinance
+        # returns empty for some tickers even though their BYOD data is loaded.
+        if px is None and byod_df is not None and ticker in byod_tickers:
+            byod_px_df = byod_df[byod_df["ticker"] == ticker][["date", "price"]].dropna()
+            if not byod_px_df.empty:
+                logger.warning(
+                    "%s: yfinance price unavailable; falling back to BYOD price column.",
+                    ticker,
+                )
+                px = byod_px_df.set_index("date")["price"].sort_index()
+                # Normalise index to TZ-naive midnight (BYOD dates already stripped in load_byod)
+                if px.index.tz is not None:
+                    px.index = px.index.tz_localize(None)
+                px.index = pd.to_datetime(px.index).normalize()
+                px.name = ticker
+
+        if px is None:
+            logger.warning("No prices for %s; excluded from panel.", ticker)
+            continue
 
         if byod_df is not None and ticker in byod_tickers:
             # ── Tier 1: BYOD ────────────────────────────────────────────────
