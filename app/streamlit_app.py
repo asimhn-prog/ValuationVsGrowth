@@ -179,7 +179,7 @@ def scatter_plot(
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>"
                     "Date: %{customdata[1]}<br>"
-                    f"CAGR: %{{x:.2f}}%<br>"
+                    f"Rev. CAGR p.a.: %{{x:.2f}}%<br>"
                     f"{YIELD_METRIC_LABELS.get(metric, metric)}: %{{y:.2f}}%<extra></extra>"
                 ),
             )
@@ -203,16 +203,16 @@ def scatter_plot(
                     mode="lines",
                     name=f"OLS fit (R²={reg_result.r2:.2f})",
                     line=dict(color=_COLORS["regression"], width=2, dash="dash"),
-                    hovertemplate="CAGR: %{x:.2f}%<br>Fitted yield: %{y:.2f}%<extra></extra>",
+                    hovertemplate="Rev. CAGR p.a.: %{x:.2f}%<br>Fitted yield: %{y:.2f}%<extra></extra>",
                 )
             )
 
     fig.update_layout(
         title=dict(
-            text=f"{YIELD_METRIC_LABELS.get(metric, metric)} vs 3Y Fwd Revenue CAGR — Current Snapshot",
+            text=f"{YIELD_METRIC_LABELS.get(metric, metric)} vs Revenue CAGR p.a. — Current Snapshot",
             font=dict(size=16),
         ),
-        xaxis=dict(title="3-Year Forward Revenue CAGR (%)", ticksuffix="%", gridcolor="#e5e7eb"),
+        xaxis=dict(title="Revenue CAGR, % p.a.", ticksuffix="%", gridcolor="#e5e7eb"),
         yaxis=dict(title=f"{YIELD_METRIC_LABELS.get(metric, metric)} (%)", ticksuffix="%", gridcolor="#e5e7eb"),
         legend=dict(orientation="h", y=-0.2),
         hovermode="closest",
@@ -952,7 +952,7 @@ def main() -> None:
                 "r2":                       "Mean R²",
                 "c_latest":                 "c (intercept)",
                 "m_latest":                 "m (slope)",
-                "x_latest":                 "x (CAGR)",
+                "x_latest":                 "Rev. CAGR p.a.",
                 "n_obs":                    "n (tickers)",
                 "latest_actual_yield":      "Observed yield",
                 "latest_predicted_yield":   "Fair yield",
@@ -971,7 +971,7 @@ def main() -> None:
                         "Mean R²":          "{:.3f}",
                         "c (intercept)":    "{:.5f}",
                         "m (slope)":        "{:.4f}",
-                        "x (CAGR)":         "{:.4f}",
+                        "Rev. CAGR p.a.":   "{:.4f}",
                         "Observed yield":   "{:.4f}",
                         "Fair yield":       "{:.4f}",
                         "Spread (obs−fair)":"{:+.4f}",
