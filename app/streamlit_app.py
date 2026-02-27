@@ -781,7 +781,11 @@ def main() -> None:
         for tkr in all_tickers:
             sub = panel[panel["ticker"] == tkr]
             tier_val = sub["data_tier"].iloc[0] if not sub.empty else "?"
-            row_d = {"Ticker": tkr, "Tier": int(tier_val) if not pd.isna(tier_val) else "?",
+            try:
+                tier_display = int(tier_val)
+            except (ValueError, TypeError):
+                tier_display = str(tier_val)
+            row_d = {"Ticker": tkr, "Tier": tier_display,
                      "Rows": len(sub)}
             for col in diag_cols:
                 lbl = _diag_labels.get(col, col)
