@@ -39,11 +39,15 @@ from data_sources.yahoo import fetch_price_history, fetch_trailing_fundamentals
 
 logger = logging.getLogger(__name__)
 
-# Fundamental columns supplied by BYOD
+# Fundamental columns carried from BYOD into the panel.
+# NOTE: market_cap and enterprise_value are intentionally excluded.
+# They are recomputed each period from (yfinance price × BYOD shares_outstanding)
+# so that EV-based multiples (EV/EBITDA, EV/Sales, etc.) vary with the actual
+# market price over time, rather than being a static Bloomberg snapshot.
 _BYOD_FUND_COLS = [
     "shares_outstanding", "total_debt", "cash",
     "fwd_eps_1y", "fwd_revenue_1y", "fwd_ebitda_1y", "fwd_fcf_1y",
-    "fwd_revenue_4y", "market_cap", "enterprise_value",
+    "fwd_revenue_4y",
 ]
 
 # Fundamental columns supplied by yfinance trailing
