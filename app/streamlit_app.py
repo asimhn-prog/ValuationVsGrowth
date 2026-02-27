@@ -776,6 +776,7 @@ def main() -> None:
     # ── Data quality diagnostic ───────────────────────────────────────────────
     with st.expander("🔍 Data diagnostic (click to inspect if charts are blank)"):
         diag_cols = ["fwd_cagr_3y"] + ALL_METRICS
+        _diag_labels = {"fwd_cagr_3y": "Rev. CAGR p.a."}
         rows_diag = []
         for tkr in all_tickers:
             sub = panel[panel["ticker"] == tkr]
@@ -783,14 +784,15 @@ def main() -> None:
             row_d = {"Ticker": tkr, "Tier": int(tier_val) if not pd.isna(tier_val) else "?",
                      "Rows": len(sub)}
             for col in diag_cols:
+                lbl = _diag_labels.get(col, col)
                 if col in sub.columns:
                     nn = sub[col].notna().sum()
                     latest = sub[col].dropna().iloc[-1] if nn > 0 else None
-                    row_d[f"{col} (non-NaN)"] = nn
-                    row_d[f"{col} (latest)"] = f"{latest*100:.2f}%" if latest is not None else "NaN"
+                    row_d[f"{lbl} (non-NaN)"] = nn
+                    row_d[f"{lbl} (latest)"] = f"{latest*100:.2f}%" if latest is not None else "NaN"
                 else:
-                    row_d[f"{col} (non-NaN)"] = "col missing"
-                    row_d[f"{col} (latest)"] = "col missing"
+                    row_d[f"{lbl} (non-NaN)"] = "col missing"
+                    row_d[f"{lbl} (latest)"] = "col missing"
             rows_diag.append(row_d)
         st.dataframe(pd.DataFrame(rows_diag), use_container_width=True)
 

@@ -1,13 +1,13 @@
 """
-Compute revenue CAGR (3-year preferred, with 2Y/1Y fallback).
+Compute revenue CAGR (4-year annualised preferred, with 3Y/2Y/1Y fallback).
 
 Tier-1 (forward estimates)
 --------------------------
-  3Y Forward CAGR = (fwd_revenue_4y / fwd_revenue_1y) ^ (1/3) - 1
+  4Y Forward CAGR = (fwd_revenue_4y / fwd_revenue_1y) ^ (1/4) - 1
 
-  T_0 = fwd_revenue_1y (NTM, FY+1)
-  T_3 = fwd_revenue_4y (FY+4)
-  Annualises revenue growth over exactly 3 forward years.
+  T_0 = fwd_revenue_1y (treated as current-year baseline, FY+0/FY+1 proxy)
+  T_4 = fwd_revenue_4y (FY+4)
+  Annualises revenue growth over 4 years from the current baseline to FY+4.
 
 Tier-3 fallback (trailing TTM)
 -------------------------------
@@ -46,7 +46,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_N_YEARS = 3
+_N_YEARS = 4
 
 
 def compute_forward_cagr(df: pd.DataFrame) -> pd.DataFrame:
