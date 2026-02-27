@@ -11,13 +11,16 @@ Tier-1 (forward estimates)
 
 Tier-3 fallback (trailing TTM)
 -------------------------------
-  When forward estimates are unavailable we use trailing TTM revenue history,
-  working from the most-recent observation (T_0) backward:
+  When forward estimates are unavailable we use trailing TTM revenue history.
+  Lookback is DATE-based (not row-count-based) so it is correctly annualised
+  at any sampling frequency (daily, monthly, quarterly):
 
-    3Y CAGR  = (rev_t / rev_{t-36m}) ^ (1/3) - 1   [preferred]
-    2Y CAGR  = (rev_t / rev_{t-24m}) ^ (1/2) - 1   [if < 36 months available]
-    1Y CAGR  = (rev_t / rev_{t-12m}) ^ (1/1) - 1   [last resort]
+    3Y CAGR  = (rev_t / rev_{t-3yr}) ^ (1/actual_years) - 1   [preferred]
+    2Y CAGR  = (rev_t / rev_{t-2yr}) ^ (1/actual_years) - 1   [fallback]
+    1Y CAGR  = (rev_t / rev_{t-1yr}) ^ (1/actual_years) - 1   [last resort]
 
+  actual_years is computed from the real calendar distance between the two
+  observations, so the annualisation is exact rather than assumed.
   The horizon actually used is recorded in ``fwd_cagr_years`` (3, 2, or 1).
 
 Mixed-tier handling
@@ -99,7 +102,7 @@ def compute_forward_cagr(df: pd.DataFrame) -> pd.DataFrame:
     if has_ttm and still_nan_mask.any():
         logger.info(
             "fwd_cagr_3y: filling %d rows with Tier-3 trailing CAGR "
-            "(3Y → 2Y → 1Y fallback).",
+            "(3Y -> 2Y -> 1Y fallback).",
             int(still_nan_mask.sum()),
         )
         for ticker, grp in df.groupby("ticker", sort=False):
@@ -108,26 +111,48 @@ def compute_forward_cagr(df: pd.DataFrame) -> pd.DataFrame:
             if not still_nan_mask[idx].any():
                 continue
 
-            rev = grp["ttm_revenue"].values.astype(float)
-            m   = len(rev)
+            dates = grp["date"].values  # numpy datetime64[ns], sorted ascending
+            rev   = grp["ttm_revenue"].values.astype(float)
+            m     = len(rev)
 
             local_cagr = cagr_arr[idx].copy()
             local_year = year_arr[idx].copy()
 
-            for lag_periods, n_years in [(36, 3), (24, 2), (12, 1)]:
-                if m <= lag_periods:
-                    continue
-                rev_lag = np.full(m, np.nan)
-                rev_lag[lag_periods:] = rev[: m - lag_periods]
+            # Date-based lookback: avoids the row-offset assumption that the data
+            # is monthly.  Works correctly for daily, monthly, and quarterly freq.
+            for target_years in [3, 2, 1]:
+                # Approximate cutoff: target_years × 365.25 days back
+                lookback = np.timedelta64(int(target_years * 365.25), "D")
+                cutoff_dates = dates - lookback  # shape (m,)
+
+                # For each row i, find the last j where dates[j] <= cutoff_dates[i]
+                # and rev[j] is valid, using searchsorted for O(log m) per row.
+                j_upper = np.searchsorted(dates, cutoff_dates, side="right") - 1
+
+                rev_lag      = np.full(m, np.nan)
+                actual_years = np.full(m, np.nan)
+
+                for i in range(m):
+                    if j_upper[i] < 0:
+                        continue
+                    # Scan backward from j_upper[i] to find the most recent valid rev
+                    for j in range(j_upper[i], -1, -1):
+                        if rev[j] > 0 and np.isfinite(rev[j]):
+                            rev_lag[i] = rev[j]
+                            days = (dates[i] - dates[j]).astype("timedelta64[D]").astype(int)
+                            actual_years[i] = days / 365.25
+                            break
+
                 fill = (
                     np.isnan(local_cagr)
                     & (rev > 0) & np.isfinite(rev)
-                    & (rev_lag > 0) & np.isfinite(rev_lag)
+                    & np.isfinite(rev_lag)
+                    & (actual_years >= 0.5)   # require at least 6 months of history
                 )
                 local_cagr = np.where(
-                    fill, (rev / rev_lag) ** (1.0 / n_years) - 1, local_cagr
+                    fill, (rev / rev_lag) ** (1.0 / actual_years) - 1, local_cagr
                 )
-                local_year = np.where(fill, float(n_years), local_year)
+                local_year = np.where(fill, float(target_years), local_year)
 
             # Mark newly filled rows as Tier 3
             newly_filled = ~np.isnan(local_cagr) & np.isnan(tier_arr[idx])
