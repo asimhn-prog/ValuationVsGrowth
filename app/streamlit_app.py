@@ -27,7 +27,7 @@ from data_sources.byod import load_byod, validate_byod, REQUIRED_COLS as BYOD_RE
 from transforms.compute_ev import ensure_ev
 from transforms.compute_forward_metrics import (
     ALL_METRICS,
-    MULTIPLE_LABELS,
+
     YIELD_METRIC_LABELS,
     compute_valuation_yields,
 )
@@ -475,22 +475,29 @@ def basket_gap_timeseries(
     primary: str,
 ) -> go.Figure:
     """
-    Time-series of the gap (actual multiple − predicted multiple) for every
-    basket ticker, plus the primary security.
+    Time-series of the premium/discount gap for basket tickers and the primary
+    security, computed in yield space so the basket mean oscillates around zero.
 
-    For each date the cross-sectional coefficients are applied to every basket
-    ticker to get its 'fair' multiple; the gap is actual − fair.
+    Gap = fair_yield − actual_yield  (× 100, shown as % p.a.)
+      > 0  →  actual yield is BELOW the regression line
+              → stock trades at a PREMIUM (higher multiple than peers)
+      < 0  →  actual yield is ABOVE the regression line
+              → stock trades at a DISCOUNT (lower multiple than peers)
 
-    • Shaded band = 25th–75th percentile across basket tickers each month.
-    • Green line   = basket mean gap.
+    Using yield space (rather than multiple space) ensures the basket mean gap
+    is zero on average by the OLS normal equations, so the chart clearly shows
+    both premium and discount periods for each ticker and the primary security.
+
+    • Shaded band = 25th–75th percentile across basket tickers each period.
+    • Green line   = basket mean gap (oscillates around zero).
     • Blue line    = primary security gap.
     • Dashed zero  = fairly-valued level.
     """
     fig = go.Figure()
     x_col = "fwd_cagr_3y"
-    mult_label = MULTIPLE_LABELS.get(metric, metric)
+    metric_label = YIELD_METRIC_LABELS.get(metric, metric)
 
-    # ── Basket gaps ────────────────────────────────────────────────────────────
+    # ── Basket gaps (yield space) ───────────────────────────────────────────────
     if cross_sec_df is not None and not cross_sec_df.empty:
         cs = cross_sec_df.set_index("date")[["c", "m"]]
 
@@ -498,14 +505,17 @@ def basket_gap_timeseries(
         work = work.join(cs, on="date")          # adds c and m per date
         work["fair_yield"] = work["c"] + work["m"] * work[x_col]
 
-        # Keep only rows where both actual and fair yields are positive
+        # Require actual yield to be positive (proxy for meaningful valuation)
+        # and fair_yield to be finite; fair_yield can be negative if the OLS
+        # extrapolates beyond the basket CAGR range — that's allowed here.
         valid = (
             work[metric].notna() & (work[metric] > 0) &
-            work["fair_yield"].notna() & (work["fair_yield"] > 0) &
+            work["fair_yield"].notna() & np.isfinite(work["fair_yield"]) &
             work[x_col].notna()
         )
         work = work[valid].copy()
-        work["gap"] = 1.0 / work[metric] - 1.0 / work["fair_yield"]
+        # gap > 0 → premium (expensive); gap < 0 → discount (cheap)
+        work["gap"] = (work["fair_yield"] - work[metric]) * 100
 
         agg = (
             work.groupby("date")["gap"]
@@ -535,18 +545,22 @@ def basket_gap_timeseries(
                 mode="lines",
                 name="Basket mean gap",
                 line=dict(color=_COLORS["basket"], width=2),
-                hovertemplate="Date: %{x|%Y-%m-%d}<br>Basket mean gap: %{y:.1f}x<extra></extra>",
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Basket mean: %{y:+.2f}%<extra></extra>",
             ))
 
-    # ── Primary security gap ───────────────────────────────────────────────────
+    # ── Primary security gap (yield space, from pre-computed premium_yield) ────
+    # premium_yield = actual − predicted  →  gap = −premium_yield = predicted − actual
+    # so positive gap = actual yield below regression line = premium (expensive).
     if (
         preds_df is not None
-        and "actual_multiple" in preds_df.columns
-        and "predicted_multiple" in preds_df.columns
+        and not preds_df.empty
+        and "premium_yield" in preds_df.columns
+        and metric in preds_df.columns
     ):
-        prim = preds_df.dropna(subset=["actual_multiple", "predicted_multiple"]).copy()
-        prim["gap"] = prim["actual_multiple"] - prim["predicted_multiple"]
+        prim = preds_df.dropna(subset=["premium_yield", metric]).copy()
+        prim = prim[prim[metric] > 0]   # skip periods with non-positive actual yield
         if not prim.empty:
+            prim["gap"] = -prim["premium_yield"] * 100   # invert so +ve = premium
             fig.add_trace(go.Scatter(
                 x=prim["date"],
                 y=prim["gap"].round(2),
@@ -555,7 +569,7 @@ def basket_gap_timeseries(
                 line=dict(color=_COLORS["security"], width=2.5),
                 hovertemplate=(
                     f"Date: %{{x|%Y-%m-%d}}<br>"
-                    f"{primary} gap: %{{y:.1f}}x<extra></extra>"
+                    f"{primary}: %{{y:+.2f}}%<extra></extra>"
                 ),
             ))
 
@@ -564,12 +578,13 @@ def basket_gap_timeseries(
 
     fig.update_layout(
         title=dict(
-            text=f"Multiple Gap: Actual vs Predicted {mult_label}",
+            text=f"Premium / Discount vs Basket Regression — {metric_label}",
             font=dict(size=15),
         ),
         xaxis=dict(title="Date", gridcolor="#e5e7eb"),
         yaxis=dict(
-            title=f"Actual − Predicted {mult_label} (turns)",
+            title="Premium / Discount (% p.a.)",
+            ticksuffix="%",
             gridcolor="#e5e7eb",
             zeroline=False,
         ),
@@ -950,9 +965,11 @@ def main() -> None:
         )
         st.plotly_chart(fig_gap, use_container_width=True)
         st.caption(
-            "Gap = actual multiple − predicted multiple from the cross-sectional regression.  "
-            "Positive = trading at a **premium** to fair value; "
-            "negative = **discount**.  "
+            "Gap = fair yield − actual yield (both from the cross-sectional regression), in % p.a.  "
+            "**Positive** = actual yield is *below* the regression line → trading at a **premium** "
+            "(higher multiple than peers imply); "
+            "**negative** = actual yield is *above* the line → trading at a **discount**.  "
+            "The basket mean gap oscillates around zero by construction (OLS residuals sum to zero).  "
             "Shaded band shows 25th–75th percentile range across basket tickers."
         )
 
