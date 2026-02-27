@@ -148,6 +148,29 @@ def load_byod(path: Union[str, Path]) -> pd.DataFrame:
             "Please refresh your Bloomberg connection and re-export."
         )
 
+    # ── Auto-annualise quarterly fwd_*_1y estimates ──────────────────────────
+    # Bloomberg BEST_SALES (and related fields) can be exported at quarterly
+    # periodicity, returning the NEXT QUARTER's consensus rather than the full
+    # fiscal-year estimate.  When that happens fwd_revenue_4y / fwd_revenue_1y
+    # ≈ 5-8×, producing implied 3Y CAGRs of 70-100%.  Detect this and scale
+    # all fwd_*_1y columns by 4 to convert to an annualised equivalent.
+    _FWD_1Y_COLS = ["fwd_revenue_1y", "fwd_ebitda_1y", "fwd_eps_1y", "fwd_fcf_1y"]
+    if "fwd_revenue_4y" in df.columns and "fwd_revenue_1y" in df.columns:
+        ratio = (df["fwd_revenue_4y"] / df["fwd_revenue_1y"]).replace([np.inf, -np.inf], np.nan)
+        valid_ratio = ratio[(ratio > 0) & ratio.notna()]
+        if not valid_ratio.empty:
+            implied_cagr = valid_ratio.median() ** (1.0 / 3) - 1
+            if implied_cagr > 0.5:
+                cols_scaled = [c for c in _FWD_1Y_COLS if c in df.columns]
+                for col in cols_scaled:
+                    df[col] = df[col] * 4
+                logger.warning(
+                    "Auto-annualised fwd_*_1y columns (x4): implied 3Y CAGR was %.0f%% "
+                    "(>50%% indicates Bloomberg quarterly export). Columns scaled: %s",
+                    implied_cagr * 100,
+                    cols_scaled,
+                )
+
     # ── Derive optional columns if absent ────────────────────────────────────
     if "market_cap" not in df.columns:
         df["market_cap"] = df["price"] * df["shares_outstanding"]
